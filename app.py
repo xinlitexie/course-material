@@ -5,107 +5,111 @@ import numpy as np
 import pandas as pd
 import time
 from sklearn.cluster import KMeans
-from scipy.stats import gaussian_kde
 
 # --- 1. 页面配置 ---
-st.set_page_config(page_title="多源分区热力监控系统", layout="wide")
+st.set_page_config(page_title="大规模多源传播溯源仿真系统", layout="wide")
+plt.rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['axes.unicode_minus'] = False
 
-# --- 2. 核心：强制地理分区布局 (防止聚集成团) ---
+# --- 2. 大规模网络生成优化 ---
 @st.cache_resource
-def get_isolated_islands(n, m, k_centers, seed):
-    np.random.seed(seed)
-    g = nx.connected_watts_strogatz_graph(n, k=m*2, p=0.1, seed=seed)
-    
-    # 强制将中心点拉开极大距离
-    theta = np.linspace(0, 2*np.pi, k_centers, endpoint=False)
-    # 增加半径到 5.0，确保物理隔离
-    centers = np.column_stack([np.cos(theta), np.sin(theta)]) * 5.0 
-    
-    pos = {}
-    nodes = list(g.nodes())
-    node_to_island = {}
-    
-    for i, node in enumerate(nodes):
-        c_idx = i % k_centers
-        node_to_island[node] = c_idx
-        # 在各自的岛屿中心附近随机分布
-        pos[node] = centers[c_idx] + np.random.normal(0, 0.8, 2)
-        
-    return g, pos, node_to_island
+def get_large_network(n, m, seed):
+    # 使用更高效的生成算法
+    g = nx.barabasi_albert_graph(n, m, seed=seed)
+    # 针对大规模图优化布局计算
+    pos = nx.spring_layout(g, k=1/np.sqrt(n)*2, iterations=30, seed=seed)
+    return g, pos
 
-# --- 3. 参数设置 ---
-st.sidebar.header("⚙️ 模拟参数")
-n_val = st.sidebar.slider("总人口 (N)", 500, 2000, 1000)
-m_val = st.sidebar.slider("连接密度 (M)", 1, 5, 2)
-t_val = st.sidebar.slider("传播概率 (T)", 0.05, 0.5, 0.15)
-x_rounds = st.sidebar.slider("干预启动轮次 (X)", 1, 20, 6)
-src_count = st.sidebar.slider("源头数量", 1, 8, 3)
-det_val = st.sidebar.slider("监测率 (Recall)", 0.1, 1.0, 0.7)
+# --- 3. 侧边栏：扩展参数范围 ---
+st.sidebar.header("⚙️ 实验参数设置")
+n_val = st.sidebar.slider("总人口 (N)", 500, 3000, 1200) # 增加到3000
+m_val = st.sidebar.slider("网络稠密度 (M)", 1, 5, 2)
+t_val = st.sidebar.slider("传播概率 (T)", 0.01, 0.5, 0.12)
+x_rounds = st.sidebar.slider("干预启动轮次 (X)", 1, 30, 8) 
+det_val = st.sidebar.slider("流调监测率 (Recall)", 0.1, 1.0, 0.7)
+src_count = st.sidebar.slider("初始源头数量", 1, 8, 3) # 增加到8个源头
 seed_val = st.sidebar.number_input("随机种子", value=42)
 
-# 初始化/重置
+# 参数自动重置
 params_key = f"{n_val}-{m_val}-{seed_val}-{src_count}"
 if 'last_key' not in st.session_state or st.session_state.last_key != params_key:
     st.session_state.last_key = params_key
-    g, pos, island_map = get_isolated_islands(n_val, m_val, src_count, seed_val)
+    g, pos = get_large_network(n_val, m_val, seed_val)
     np.random.seed(seed_val)
-    # 每个岛屿选一个源头
-    true_sources = []
-    for i in range(src_count):
-        island_nodes = [n for n, isl in island_map.items() if isl == i]
-        true_sources.append(np.random.choice(island_nodes))
-    
+    true_sources = list(np.random.choice(list(g.nodes()), src_count, replace=False))
     st.session_state.update({
-        'step': 0, 'running': False, 'g': g, 'pos': pos, 'island_map': island_map,
+        'step': 0, 'running': False, 'g': g, 'pos': pos,
         'true_sources': true_sources,
         'infected': set(true_sources),
         'quarantined': set(),
         'known_cases': set(),
-        'node_src_map': {n: island_map[n] for n in true_sources},
-        'pred_sources': [], 'avg_err': 0.0, 'sse': [], 'est_k': 1, 'is_contained': False
+        'pred_sources': [],
+        'avg_error_dist': 0.0,
+        'node_source_map': {node: i for i, node in enumerate(true_sources)},
+        'sse_list': [], 'est_k': 0, 'is_contained': False
     })
 
 s = st.session_state
 
-# --- 4. 演化逻辑 ---
+# --- 4. 核心计算逻辑 ---
+def calculate_error_distance():
+    """计算多源头平均误差距离：每个真实源头到最近预测源头的平均跳数"""
+    if not s.pred_sources: return 0.0
+    total_dist = 0
+    for ts in s.true_sources:
+        dists = []
+        for ps in s.pred_sources:
+            try:
+                # 计算图上的最短路径跳数
+                d = nx.shortest_path_length(s.g, source=ts, target=ps)
+                dists.append(d)
+            except nx.NetworkXNoPath:
+                dists.append(20) # 无法到达则设定一个较大的惩罚值
+        total_dist += min(dists) if dists else 20
+    return total_dist / len(s.true_sources)
+
 def iterate_step():
     if s.is_contained: return
     
-    # A. 同步传播
-    active = [n for n in s.infected if n not in s.quarantined]
-    if not active and s.step > 0: s.is_contained = True; return
+    # A. 同步传播 (T 概率)
+    spreaders = [n for n in s.infected if n not in s.quarantined]
+    if not spreaders and s.step > 0:
+        s.is_contained = True; return
 
     new_inf = {}
-    for u in active:
-        u_src = s.node_src_map.get(u, 0)
+    for u in spreaders:
+        u_src = s.node_source_map.get(u, 0)
         for v in s.g.neighbors(u):
             if v not in s.infected and v not in s.quarantined:
-                if np.random.rand() < t_val: new_inf[v] = u_src
+                if np.random.rand() < t_val:
+                    new_inf[v] = u_src
     
-    for v, sid in new_inf.items():
+    for v, src_id in new_inf.items():
         s.infected.add(v)
-        s.node_src_map[v] = sid
+        s.node_source_map[v] = src_id
 
-    # B. 隔离干预 (Step >= X)
+    # B. 干预逻辑 (Step >= X)
     if s.step >= x_rounds:
         detected = {n for n in (s.infected - s.quarantined) if np.random.rand() < det_val}
         s.known_cases.update(detected)
-        
-        if len(s.known_cases) >= 3:
+
+        if len(s.known_cases) >= 5:
             coords = np.array([s.pos[n] for n in s.known_cases])
-            k_range = range(1, min(len(s.known_cases), 10))
-            sse = [KMeans(n_clusters=k, n_init=3).fit(coords).inertia_ for k in k_range]
-            s.sse = sse
+            k_range = range(1, min(len(s.known_cases), 12))
+            sse = [KMeans(n_clusters=k, n_init=5, random_state=42).fit(coords).inertia_ for k in k_range]
+            s.sse_list = sse
             
+            # 肘部算法推断 K
             if len(sse) >= 3:
-                # 肘部算法计算
-                dists = [np.abs(np.cross(np.array([len(sse),sse[-1]])-np.array([1,sse[0]]), np.array([1,sse[0]])-np.array([i+1,s]))) for i,s in enumerate(sse)]
+                p1, p2 = np.array([1, sse[0]]), np.array([len(sse), sse[-1]])
+                dists = [np.abs(np.cross(p2-p1, p1-np.array([i+1, sse[i]]))) / np.linalg.norm(p2-p1) for i in range(len(sse))]
                 s.est_k = k_range[np.argmax(dists)]
                 
-                km = KMeans(n_clusters=s.est_k, n_init=5).fit(coords)
+                # 聚类隔离与溯源
+                km = KMeans(n_clusters=s.est_k, n_init=10).fit(coords)
                 s.pred_sources = []
                 for i in range(s.est_k):
-                    nodes = [list(s.known_cases)[j] for j, l in enumerate(km.labels_) if l == i]
+                    nodes = [list(s.known_cases)[j] for j, label in enumerate(km.labels_) if label == i]
                     if nodes:
                         try:
                             st_tree = nx.algorithms.approximation.steiner_tree(s.g, nodes)
@@ -114,101 +118,107 @@ def iterate_step():
                             s.pred_sources.append(min(nx.eccentricity(sub), key=nx.eccentricity(sub).get))
                         except: pass
             
-            if s.pred_sources:
-                errs = [min([nx.shortest_path_length(s.g, ts, ps) for ps in s.pred_sources]) for ts in s.true_sources]
-                s.avg_err = np.mean(errs)
+            # 计算溯源误差
+            s.avg_error_dist = calculate_error_distance()
+    
     s.step += 1
 
-# --- 5. 渲染引擎 ---
+# --- 5. 绘图：针对大规模图优化 ---
 def draw_map():
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.set_facecolor('#ffffff')
-    
-    # 限制显示范围，防止岛屿太远看不见
-    ax.set_xlim(-8, 8); ax.set_ylim(-8, 8)
+    # 针对大规模节点调小画布点的大小
+    fig, ax = plt.subplots(figsize=(10, 8))
+    # 大规模下将边设为几乎不可见，避免发丝效应
+    nx.draw_networkx_edges(s.g, s.pos, ax=ax, alpha=0.01, edge_color='gray')
 
-    # A. KDE 热力图层
-    inf_nodes = list(s.infected - s.quarantined)
-    if len(inf_nodes) >= 5:
-        try:
-            inf_coords = np.array([s.pos[n] for n in inf_nodes])
-            xx, yy = np.mgrid[-8:8:100j, -8:8:100j]
-            kernel = gaussian_kde(inf_coords.T)
-            f = np.reshape(kernel(np.vstack([xx.ravel(), yy.ravel()])).T, xx.shape)
-            ax.contourf(xx, yy, f, cmap='Spectral_r', alpha=0.4, levels=15, zorder=0)
-            ax.contour(xx, yy, f, colors='black', alpha=0.1, levels=10, linewidths=0.5, zorder=1)
-        except: pass
+    inf_free = s.infected - s.quarantined
+    inf_q = s.infected & s.quarantined
+    healthy_free = set(s.g.nodes()) - s.infected - s.quarantined
+    healthy_q = s.quarantined - s.infected
 
-    # B. 节点渲染
-    # 1. 健康人 (天蓝)
-    h_free = [n for n in s.g.nodes() if n not in s.infected and n not in s.quarantined]
-    if h_free:
-        h_pos = np.array([s.pos[n] for n in h_free])
-        ax.scatter(h_pos[:,0], h_pos[:,1], c='#87CEEB', s=20, alpha=0.5, zorder=2)
-
-    # 2. 隔离光晕 (深灰环)
+    # 绘制隔离光晕
     if s.quarantined:
-        q_pos = np.array([s.pos[n] for n in s.quarantined])
-        ax.scatter(q_pos[:,0], q_pos[:,1], facecolors='none', edgecolors='#444444', s=120, alpha=0.2, linewidths=2, zorder=3)
+        nx.draw_networkx_nodes(s.g, s.pos, nodelist=list(s.quarantined), 
+                               node_color='lightgray', node_size=120, alpha=0.3, ax=ax)
 
-    # 3. 感染者核心 (按源头染色)
-    if s.infected:
-        cmap = plt.cm.get_cmap('tab10', 10)
-        for n in s.infected:
-            color = cmap(s.node_src_map.get(n, 0) % 10)
-            ax.scatter(s.pos[n][0], s.pos[n][1], c=[color], s=35, 
-                       edgecolors='black' if n in s.quarantined else 'white', 
-                       linewidths=1 if n in s.quarantined else 0.5, zorder=4)
+    # 绘制健康节点核心 (缩小尺寸)
+    nx.draw_networkx_nodes(s.g, s.pos, nodelist=list(healthy_free), 
+                           node_color='#87CEEB', node_size=15, alpha=0.6, ax=ax)
+    if healthy_q:
+        nx.draw_networkx_nodes(s.g, s.pos, nodelist=list(healthy_q), 
+                               node_color='#87CEEB', node_size=15, edgecolors='black', linewidths=1, ax=ax)
 
-    # 4. 源头标注
+    # 绘制感染节点核心
+    cmap = plt.cm.get_cmap('tab10', src_count + 1)
+    for nodes, is_q in [(inf_free, False), (inf_q, True)]:
+        if nodes:
+            colors = [cmap(s.node_source_map.get(n, 0)) for n in nodes]
+            nx.draw_networkx_nodes(s.g, s.pos, nodelist=list(nodes), 
+                                   node_color=colors, node_size=40 if is_q else 30,
+                                   edgecolors='white' if not is_q else 'black', 
+                                   linewidths=1 if is_q else 0.5, ax=ax)
+
+    # 真实源头 (金星) 与 预测源头 (紫叉)
     for ts in s.true_sources:
-        ax.scatter(s.pos[ts][0], s.pos[ts][1], marker='*', s=400, c='gold', edgecolors='black', zorder=100)
+        ax.scatter(s.pos[ts][0], s.pos[ts][1], marker='*', s=400, c='gold', edgecolors='black', zorder=50)
     for ps in s.pred_sources:
-        ax.scatter(s.pos[ps][0], s.pos[ps][1], marker='x', s=250, c='purple', linewidths=3, zorder=101)
+        ax.scatter(s.pos[ps][0], s.pos[ps][1], marker='x', s=250, c='purple', linewidths=3, zorder=51)
 
-    ax.set_title(f"Step {s.step} | Multi-Island Epidemic Monitor", fontsize=15)
+    ax.set_title(f"STEP {s.step} | N={n_val} | Error Distance: {s.avg_error_dist:.2f} hops", fontsize=12)
     ax.axis('off')
     return fig
 
-# --- 6. 界面展示 ---
-st.title("🛡️ 多岛屿分区传播与动态溯源仿真")
+def draw_elbow():
+    fig, ax = plt.subplots(figsize=(5, 3))
+    if len(s.sse_list) > 1:
+        ax.plot(range(1, len(s.sse_list)+1), s.sse_list, 'ro-', linewidth=1.5)
+        ax.axvline(x=s.est_k, color='blue', linestyle='--', label=f'Best K={s.est_k}')
+        ax.set_title("Elbow Method Analysis", fontsize=10)
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, "Waiting for Round X...", ha='center')
+    plt.tight_layout()
+    return fig
 
-col_main, col_side = st.columns([3.5, 1.2])
-map_spot = col_main.empty()
-side_container = col_side.container()
+# --- 6. UI 主界面 ---
+st.title("🛡️ 大规模多源传播动态仿真与溯源评估系统")
+st.markdown(f"""
+<div style="background-color:#f8f9fa; padding:10px; border-radius:5px; border-left:5px solid #28a745; margin-bottom:15px">
+<b>实验规则：</b> 当前设定为 {src_count} 个同步爆发点。系统在第 {x_rounds} 轮前仅观察传播，随后启动肘部算法自动推断源头数量并实施封控。
+</div>
+""", unsafe_allow_html=True)
 
-if st.sidebar.button("▶️ 开启演化"):
+c_left, c_right = st.columns([3.5, 1.2])
+map_spot = c_left.empty()
+elbow_spot = c_right.empty()
+metrics_spot = c_right.empty()
+
+if st.sidebar.button("▶️ 开启实时演化模拟"):
     s.running = True
 
 if s.running:
     while not s.is_contained and s.running:
         iterate_step()
         map_spot.pyplot(draw_map())
+        elbow_spot.pyplot(draw_elbow())
         
-        with side_container:
-            # 1. 肘部图
-            fig_e, ax_e = plt.subplots(figsize=(5, 3.5))
-            if len(s.sse) > 1:
-                ax_e.plot(range(1, len(s.sse)+1), s.sse, 'ro-', markersize=4)
-                ax_e.axvline(x=s.est_k, color='blue', linestyle='--')
-                ax_e.set_title("Elbow Method (Source K)")
-            st.pyplot(fig_e)
-            plt.close(fig_e)
-
-            # 2. 混淆矩阵
-            st.markdown("#### 📊 实时数据")
-            tp = len(s.infected & s.quarantined)
-            fp = len(s.quarantined - s.infected)
-            fn = len(s.infected - s.quarantined)
-            tn = n_val - len(s.infected | s.quarantined)
-            st.table(pd.DataFrame({"Isolated": [tp, fp], "Free": [fn, tn]}, index=["Sick", "Healthy"]))
+        with metrics_spot.container():
+            st.markdown("#### 📊 实时评估指标")
+            st.metric("平均溯源误差 (跳数)", f"{s.avg_error_dist:.2f} hops")
             
-            # 3. 指标
-            st.metric("平均溯源距离误差", f"{s.avg_err:.2f} Hops")
-            st.metric("捕捉率 (Recall)", f"{tp/(tp+fn+1e-5):.1%}")
-            st.write(f"当前步数: {s.step}")
-        
-        plt.close('all')
-        time.sleep(0.01)
+            tp = len(s.infected & s.quarantined)
+            fn = len(s.infected - s.quarantined)
+            st.metric("疫情捕捉率 (Recall)", f"{tp/(tp+fn+1e-5):.1%}")
+            
+            st.write("---")
+            st.write("**混淆矩阵**")
+            fp = len(s.quarantined - s.infected)
+            tn = n_val - len(s.infected | s.quarantined)
+            st.table(pd.DataFrame({"Isolated": [tp, fp], "Free": [fn, tn]}, index=["Infected", "Healthy"]))
+
+        if s.is_contained:
+            st.success("🎉 传播链已全部切断！")
+            s.running = False
+        time.sleep(0.01) # 大规模图计算较慢，此处延迟设低
 else:
     map_spot.pyplot(draw_map())
+    elbow_spot.pyplot(draw_elbow())
