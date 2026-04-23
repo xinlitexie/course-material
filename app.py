@@ -20,8 +20,8 @@ def get_network(n, m, seed):
 
 # --- 3. 侧边栏与参数重置 ---
 st.sidebar.header("🕹️ 模拟控制")
-n_val = st.sidebar.slider("总人口", 200, 1000, 600)
-m_val = st.sidebar.slider("网络密度", 1, 3, 2)
+n_val = st.sidebar.slider("总人口", 200, 2000, 800)
+m_val = st.sidebar.slider("网络密度", 1, 5, 3)
 t_val = st.sidebar.slider("传播率 (T)", 0.01, 0.4, 0.15)
 det_val = st.sidebar.slider("检测率 (Recall)", 0.1, 1.0, 0.7)
 source_count = st.sidebar.slider("初始源头数", 1, 5, 3)
