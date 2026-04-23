@@ -2,4 +2,6 @@ streamlit
 networkx
 matplotlib
 numpy
+pandas
+scikit-learn
 scipy
